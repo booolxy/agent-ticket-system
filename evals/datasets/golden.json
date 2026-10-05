@@ -1,0 +1,66 @@
+[
+  {
+    "id": "refund_001",
+    "query": "订单 ORD-123 我要退款，已经发货了",
+    "expected_intent": "refund",
+    "expected_fields": ["order_id", "status", "amount"],
+    "expected_need_human": true,
+    "category": "退款"
+  },
+  {
+    "id": "refund_002",
+    "query": "我的订单 ORD-456 还没发货，能不能退",
+    "expected_intent": "refund",
+    "expected_fields": ["order_id", "status"],
+    "expected_need_human": true,
+    "category": "退款"
+  },
+  {
+    "id": "tech_001",
+    "query": "页面白屏了怎么办",
+    "expected_intent": "tech",
+    "expected_fields": ["solution"],
+    "expected_need_human": false,
+    "category": "技术"
+  },
+  {
+    "id": "tech_002",
+    "query": "系统报 500 错误，接口调不通",
+    "expected_intent": "tech",
+    "expected_fields": ["solution"],
+    "expected_need_human": false,
+    "category": "技术"
+  },
+  {
+    "id": "account_001",
+    "query": "我要重置密码，手机号不用了",
+    "expected_intent": "account",
+    "expected_fields": ["verify_method"],
+    "expected_need_human": true,
+    "category": "账户"
+  },
+  {
+    "id": "account_002",
+    "query": "帮我把密码重置一下",
+    "expected_intent": "account",
+    "expected_fields": ["verify_method"],
+    "expected_need_human": true,
+    "category": "账户"
+  },
+  {
+    "id": "simple_001",
+    "query": "你好",
+    "expected_intent": "simple",
+    "expected_fields": [],
+    "expected_need_human": false,
+    "category": "闲聊"
+  },
+  {
+    "id": "unknown_001",
+    "query": "今天天气怎么样",
+    "expected_intent": "unknown",
+    "expected_fields": [],
+    "expected_need_human": false,
+    "category": "其他"
+  }
+]
