@@ -1,23 +1,44 @@
 # scripts/test_graph.py
-from langchain_openai import ChatOpenAI
+from app.core.llm_factory import get_large_llm, get_small_llm
 from app.agent.graph.main_graph import MainGraph
 
-# 临时用云端 LLM 做验证（后续可换微调后的 Qwen-1.8B）
-llm = ChatOpenAI(
-    model="gpt-3.5-turbo",
-    api_key="sk-xxx",       # 换成你自己的 Key
-    base_url="https://api.openai.com/v1",
-    temperature=0
-)
+large_llm = get_large_llm()
+small_llm = get_small_llm()
+graph = MainGraph(llm=large_llm, small_llm=small_llm)
 
-graph = MainGraph(llm)
-config = {"configurable": {"thread_id": "test-001"}}
-result = graph.graph.invoke(
-    {"user_query": "订单 ORD-123 我要退款"},
-    config=config,
-)
 
-print("意图：", result.get("intent"))
-print("退款结果：", result.get("refund_result"))
-print("是否需人工：", result.get("need_human"))
-print("最终回复：", result.get("final_response"))
+def run(query: str):
+    print(f"\n{'=' * 70}")
+    print(f"🔍 用户Query: {query}")
+    print(f"{'=' * 70}")
+
+    config = {"configurable": {"thread_id": f"test-{hash(query) % 10000}"}}
+    result = graph.graph.invoke({"user_query": query}, config=config)
+
+    # 打印 Planner 的 DAG
+    print(f"\n📋 Planner 拆解：")
+    for t in result.get("plan", []):
+        print(f"  - {t['id']}: [{t['intent']}] {t['query']} | depends_on={t['depends_on']}")
+
+    print(f"\n🔀 拓扑排序执行顺序：{result.get('execution_order', [])}")
+
+    print(f"\n✅ 子任务结果：")
+    for tid, r in result.get("task_results", {}).items():
+        print(f"  - {tid}: {str(r)[:100]}...")
+
+    print(f"\n💬 最终回复：{result.get('final_response', '')}")
+    print(f"🚨 是否需人工：{result.get('need_human', False)}")
+
+
+if __name__ == "__main__":
+    # 测试 1：单意图
+    run("订单 ORD-123 我要退款")
+
+    # 测试 2：多意图无依赖
+    run("我要退款，顺便查一下我的余额")
+
+    # 测试 3：多意图有依赖（拓扑排序生效）
+    run("帮我重置密码，然后查一下订单 ORD-123 能不能退")
+
+    # 测试 4：三意图复杂场景
+    run("系统报500错误，顺便帮我退款，再查一下我的账户余额")

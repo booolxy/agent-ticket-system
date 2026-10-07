@@ -2,12 +2,18 @@
 import re
 from typing import Dict, Any
 from langgraph.graph import StateGraph, END
+
 from app.agent.graph.state import AgentState
 from app.agent.tools.registry import tool_registry
+from app.core.security import SECURITY_SYSTEM_PROMPT, safe_llm_invoke
 from app.rag.engine import RAGEngine
 
-# 全局单例（模型加载耗时长，只初始化一次）
+
+# =========================================================
+# RAG 引擎单例（模型加载耗时长，只初始化一次）
+# =========================================================
 _rag_engine: RAGEngine = None
+
 
 def get_rag_engine() -> RAGEngine:
     global _rag_engine
@@ -22,29 +28,39 @@ class RefundWorker:
       - 线性工作流，容错率为零
       - LLM 只负责提取参数和生成话术
       - 高危工具（initiate_refund）必须走 pending_approval
+      - 所有 LLM 调用经 safe_llm_invoke 注入安全防护
     """
+
     def __init__(self, llm):
         self.llm = llm
         self.rag = get_rag_engine()
         self.graph = self._build_graph()
 
-    # ==================== 节点定义 ====================
+    # ==================== 节点 1：提取订单号 ====================
     def node_extract_order(self, state: AgentState) -> Dict[str, Any]:
-        """节点1：从用户问题中提取订单号"""
+        """节点1：从用户问题中提取订单号（正则优先，LLM 兜底）"""
         query = state["user_query"]
-        # 先用正则提取，命中直接返回（零 LLM 成本）
+
+        # 正则优先，零 LLM 成本
         match = re.search(r"(ORD[-\s]?\d+|订单号[:：]?\s*\w+)", query, re.IGNORECASE)
         if match:
-            order_id = match.group(0).replace("订单号", "").replace(":", "").replace("：", "").strip()
+            order_id = (
+                match.group(0)
+                .replace("订单号", "")
+                .replace(":", "")
+                .replace("：", "")
+                .strip()
+            )
         else:
-            # 正则未命中，用 LLM 提取
+            # 【安全层 2】用 safe_llm_invoke 注入安全提示 + 输出检查
             prompt = f"从下面这句话中提取订单号，只输出订单号，没有则输出 NONE：\n{query}"
-            order_id = self.llm.invoke(prompt).content.strip()
+            order_id = safe_llm_invoke(self.llm, prompt).strip()
             if order_id.upper() == "NONE":
                 order_id = None
 
         return {"refund_result": {"order_id": order_id, "stage": "extracted"}}
 
+    # ==================== 节点 2：查订单状态 ====================
     def node_query_order(self, state: AgentState) -> Dict[str, Any]:
         """节点2：调用工具查询订单状态"""
         refund = state.get("refund_result", {})
@@ -56,9 +72,11 @@ class RefundWorker:
         result = tool.func(order_id=order_id)
         return {"refund_result": {**refund, **result, "stage": "queried"}}
 
+    # ==================== 节点 3：RAG 检索退款政策 ====================
     def node_rag_policy(self, state: AgentState) -> Dict[str, Any]:
         """节点3：RAG 检索退款政策（混合检索 + RRF + 精排 + 父子召回）"""
         from app.core.database import SessionLocal
+
         db = SessionLocal()
         try:
             self.rag.build_bm25_index(db)
@@ -70,11 +88,12 @@ class RefundWorker:
         refund = state.get("refund_result", {})
         return {"refund_result": {**refund, "policy": policy_text, "stage": "policy_retrieved"}}
 
+    # ==================== 节点 4：条件判定 ====================
     def node_check_condition(self, state: AgentState) -> Dict[str, Any]:
-        """节点4：判定是否符合退款条件（规则 + LLM）"""
+        """节点4：判定是否符合退款条件（规则判定）"""
         refund = state.get("refund_result", {})
         status = refund.get("status", "")
-        # 规则判定：已发货需退货退款
+
         if status in ("已发货", "已签收"):
             eligible = True
             note = "已发货订单，符合退货退款条件，退款需扣除运费"
@@ -88,27 +107,41 @@ class RefundWorker:
             eligible = False
             note = f"当前订单状态（{status}）不符合退款条件"
 
-        return {"refund_result": {**refund, "is_eligible": eligible, "condition_note": note, "stage": "checked"}}
+        return {
+            "refund_result": {
+                **refund,
+                "is_eligible": eligible,
+                "condition_note": note,
+                "stage": "checked",
+            }
+        }
 
+    # ==================== 节点 5：生成退款建议 ====================
     def node_generate_suggestion(self, state: AgentState) -> Dict[str, Any]:
         """节点5：生成退款建议（LLM 生成话术）"""
         refund = state.get("refund_result", {})
         if not refund.get("is_eligible"):
-            return {"refund_result": {**refund, "suggestion": refund.get("condition_note", "")}}
+            return {
+                "refund_result": {
+                    **refund,
+                    "suggestion": refund.get("condition_note", ""),
+                }
+            }
 
         prompt = (
             f"订单 {refund.get('order_id')} 状态：{refund.get('status')}，"
             f"金额：{refund.get('amount')} 元，退款政策：{refund.get('policy')}。\n"
             f"请用客服口吻生成一段给用户的退款建议（不超过 80 字）。"
         )
-        suggestion = self.llm.invoke(prompt).content.strip()
+        # 【安全层 2 + 3】safe_llm_invoke 自动注入安全提示 + 输出检查
+        suggestion = safe_llm_invoke(self.llm, prompt).strip()
         return {"refund_result": {**refund, "suggestion": suggestion, "stage": "suggested"}}
 
+    # ==================== 节点 6：高危操作挂起 ====================
     def node_pending_approval(self, state: AgentState) -> Dict[str, Any]:
         """节点6：高危操作挂起，等待人工确认（Human-in-the-loop）"""
         refund = state.get("refund_result", {})
         if not refund.get("is_eligible"):
-            # 不符合条件，不需要人工审批，直接结束
             return {"need_human": False}
 
         pending = {
@@ -120,10 +153,11 @@ class RefundWorker:
         }
         return {
             "pending_approval": pending,
-            "need_human": True,        # ⚠️ 挂起，等人工确认
+            "need_human": True,
             "refund_result": {**refund, "stage": "pending_human"},
         }
 
+    # ==================== 节点 7：执行退款（高危）====================
     def node_execute_refund(self, state: AgentState) -> Dict[str, Any]:
         """节点7：人工确认后，执行退款（高危工具）"""
         refund = state.get("refund_result", {})
@@ -155,10 +189,13 @@ class RefundWorker:
         workflow.add_edge("check_condition", "generate_suggestion")
         workflow.add_edge("generate_suggestion", "pending_approval")
 
-        # 条件分流：需要人工 → END（等外部唤醒）；不需要 → 直接 END
+        # 条件分流：需要人工 → END；不需要 → 执行退款
         workflow.add_conditional_edges(
             "pending_approval",
-            lambda s: "execute_refund" if s.get("need_human") is False and s.get("refund_result", {}).get("is_eligible") else END,
+            lambda s: "execute_refund"
+            if s.get("need_human") is False
+            and s.get("refund_result", {}).get("is_eligible")
+            else END,
             {"execute_refund": "execute_refund", END: END},
         )
         workflow.add_edge("execute_refund", END)

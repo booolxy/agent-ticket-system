@@ -1,22 +1,35 @@
 # scripts/test_rag.py
 from app.core.database import SessionLocal
+from app.core.llm_factory import get_small_llm
 from app.rag.engine import RAGEngine
+
 
 def main():
     db = SessionLocal()
     engine = RAGEngine()
-    # 构建 BM25 内存索引
     engine.build_bm25_index(db)
+    small_llm = get_small_llm()
 
-    query = "我要退款，已经发货了怎么办？"
-    print(f"\n🔍 用户提问: {query}")
-    results = engine.retrieve(db, query)
+    # 测试用例
+    queries = [
+        "我要退款，已经发货了怎么办？",      # 测 HyDE + 混合召回
+        "页面白屏了",                        # 测 BM25 精确匹配
+        "手机号不用了，怎么重置密码",         # 测 small-to-big
+    ]
 
-    print("\n✅ 最终返回结果（父子文档召回）:")
-    for r in results:
-        print(f"- 子块: {r['content']}")
-        print(f"  父块: {r['parent_content']}")
-        print(f"  精排得分: {r['score']:.4f}\n")
+    for q in queries:
+        print(f"\n{'=' * 60}")
+        print(f"🔍 Query: {q}")
+        print(f"{'=' * 60}")
+
+        results = engine.retrieve(db, q, small_llm=small_llm, use_hyde=True, top_k=2)
+
+        for i, r in enumerate(results, 1):
+            print(f"\n【Top {i}】")
+            print(f"  子块: {r['content'][:60]}...")
+            print(f"  父块: {r['parent_content'][:100]}...")
+            print(f"  RRF 分: {r['rrf_score']:.4f} | Rerank 分: {r['rerank_score']:.4f}")
+
 
 if __name__ == "__main__":
     main()

@@ -22,7 +22,7 @@ models/
 pgdata/
 redisdata/
 
-# ============ finetune 数据（除 seeds 外都不传）============
+# ============ finetun  e 数据（除 seeds 外都不传）============
 finetune/data/raw.jsonl
 finetune/data/deduped.jsonl
 finetune/data/train.jsonl

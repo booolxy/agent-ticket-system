@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.core.llm_factory import get_large_llm, get_small_llm
+from app.core.security import InputGuard, OutputGuard
 from app.agent.graph.main_graph import MainGraph
 from app.api.approval import router as approval_router
 
@@ -25,15 +26,9 @@ app = FastAPI(
 
 
 # =========================================================
-# 2. 入口层：令牌桶限流（单机版；生产替换为 Redis + Lua）
+# 2. 令牌桶限流
 # =========================================================
 class TokenBucket:
-    """
-    内存令牌桶：
-      - rate：每秒补充的令牌数（QPS）
-      - capacity：桶容量（允许的突发流量）
-    生产环境必须替换为 Redis 版，支持分布式多实例。
-    """
     def __init__(self, rate: float = 10.0, capacity: int = 20):
         self.rate = rate
         self.capacity = capacity
@@ -43,11 +38,8 @@ class TokenBucket:
     def allow(self, key: str) -> bool:
         now = time.time()
         elapsed = now - self._last_time[key]
-        self._tokens[key] = min(
-            self.capacity, self._tokens[key] + elapsed * self.rate
-        )
+        self._tokens[key] = min(self.capacity, self._tokens[key] + elapsed * self.rate)
         self._last_time[key] = now
-
         if self._tokens[key] >= 1:
             self._tokens[key] -= 1
             return True
@@ -58,18 +50,17 @@ bucket = TokenBucket(rate=10, capacity=20)
 
 
 # =========================================================
-# 3. 入口层：正则规则引擎（拦截高频确定性问题，降本）
+# 3. 正则规则引擎（业务分流，不是安全防护）
 # =========================================================
 REGEX_RULES = [
     (re.compile(r"查余额|余额查询|我的余额"), "您的账户余额为 ¥1288.00（规则引擎直接返回）"),
     (re.compile(r"转人工|人工客服|找人工"), "已为您转接人工客服，请稍候。"),
     (re.compile(r"^你好$|^您好$|^hi$|^hello$", re.IGNORECASE), "您好，请问有什么可以帮您？"),
-    (re.compile(r"改密码|重置密码"), None),  # None 表示交由 Agent 处理（高危需人工）
+    (re.compile(r"改密码|重置密码"), None),
 ]
 
 
 def regex_prefilter(query: str) -> Optional[str]:
-    """命中正则直接返回固定话术；未命中返回 None 交给 Agent"""
     for pattern, reply in REGEX_RULES:
         if pattern.search(query) and reply is not None:
             return reply
@@ -77,17 +68,15 @@ def regex_prefilter(query: str) -> Optional[str]:
 
 
 # =========================================================
-# 4. 初始化 LLM（大模型 + 小模型）与主图
+# 4. 初始化 LLM 与主图
 # =========================================================
 large_llm = get_large_llm()
 small_llm = get_small_llm()
-
-# 主图：大模型跑业务，小模型跑意图分类 / Query 改写
 main_graph = MainGraph(llm=large_llm, small_llm=small_llm)
 
 
 # =========================================================
-# 5. 小模型分流 Prompt（简历亮点：降低 API 成本）
+# 5. 小模型分流 Prompt
 # =========================================================
 SIMPLE_CLASSIFY_PROMPT = """判断下面这句话是"简单问题"还是"复杂问题"。
 简单问题：问候、闲聊、单一确定性问题，不需要查数据库、不需要调工具
@@ -110,16 +99,16 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    source: str                           # regex | small_model | agent
-    thread_id: Optional[str] = None       # Agent 会话 ID（用于后续审批）
-    intent: Optional[str] = None          # 意图标签
-    need_human: bool = False              # 是否需要人工介入
-    pending_approval: dict = {}           # 待审批信息
-    reply: str = ""                       # 最终回复
+    source: str
+    thread_id: Optional[str] = None
+    intent: Optional[str] = None
+    need_human: bool = False
+    pending_approval: dict = {}
+    reply: str = ""
 
 
 # =========================================================
-# 7. 主接口：智能工单入口（限流 → 正则 → 小模型 → Agent）
+# 7. 主接口（含三层安全防护）
 # =========================================================
 @app.post("/api/v1/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, request: Request):
@@ -129,40 +118,50 @@ async def chat(req: ChatRequest, request: Request):
     if not bucket.allow(client_ip):
         raise HTTPException(429, "请求过于频繁，请稍后再试")
 
-    # -------- 步骤 2：正则规则引擎（拦截约 35% 高频问题，零 LLM 成本）--------
+    # -------- 步骤 2：【安全层 1】用户输入黑名单拦截 --------
+    is_safe, reason = InputGuard.check(req.query)
+    if not is_safe:
+        return ChatResponse(
+            source="blocked",
+            reply=f"抱歉，无法处理该请求（{reason}）。如需帮助请联系人工客服。",
+        )
+
+    # -------- 步骤 3：正则规则引擎（业务分流）--------
     regex_reply = regex_prefilter(req.query)
     if regex_reply:
         return ChatResponse(source="regex", reply=regex_reply)
 
-    # -------- 步骤 3：小模型分流（判断简单/复杂，降本约 40%）--------
+    # -------- 步骤 4：小模型分流 --------
     try:
         classify_prompt = SIMPLE_CLASSIFY_PROMPT.format(query=req.query)
         label = small_llm.invoke(classify_prompt).content.strip()
     except Exception:
-        # 小模型异常兜底：直接当复杂问题处理
         label = "复杂"
 
     if "简单" in label:
-        # 简单问题由本地小模型直接处理，零 API 成本
         try:
             reply = small_llm.invoke(
                 SIMPLE_REPLY_PROMPT.format(query=req.query)
             ).content.strip()
         except Exception:
             reply = "您好，请问有什么可以帮您？"
+
+        # 【安全层 3】输出拦截
+        is_safe, reply = OutputGuard.check(reply)
         return ChatResponse(source="small_model", reply=reply)
 
-    # -------- 步骤 4：复杂问题走多 Agent 工作流（大模型）--------
+    # -------- 步骤 5：复杂问题走多 Agent 工作流 --------
     thread_id = f"thread-{uuid.uuid4().hex[:12]}"
     config = {"configurable": {"thread_id": thread_id}}
 
     try:
-        result = main_graph.graph.invoke(
-            {"user_query": req.query},
-            config=config,
-        )
+        result = main_graph.graph.invoke({"user_query": req.query}, config=config)
     except Exception as e:
         raise HTTPException(500, f"Agent 执行异常：{str(e)}")
+
+    # 【安全层 3】输出拦截
+    final_reply = result.get("final_response", "")
+    is_safe, final_reply = OutputGuard.check(final_reply)
 
     return ChatResponse(
         source="agent",
@@ -170,7 +169,7 @@ async def chat(req: ChatRequest, request: Request):
         intent=result.get("intent"),
         need_human=result.get("need_human", False),
         pending_approval=result.get("pending_approval", {}),
-        reply=result.get("final_response", ""),
+        reply=final_reply,
     )
 
 
@@ -179,11 +178,7 @@ async def chat(req: ChatRequest, request: Request):
 # =========================================================
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "service": settings.PROJECT_NAME,
-        "version": settings.VERSION,
-    }
+    return {"status": "ok", "service": settings.PROJECT_NAME, "version": settings.VERSION}
 
 
 # =========================================================

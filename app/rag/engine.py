@@ -1,97 +1,214 @@
 # app/rag/engine.py
-from typing import List, Dict
+"""
+RAG 引擎：完整的五层架构
+
+  第 1 层：查询理解（HyDE 改写）
+  第 2 层：多路并行召回（BM25 + 向量）
+  第 3 层：RRF 融合 + BGE-Reranker 精排
+  第 4 层：Small-to-Big 父块召回
+  第 5 层：Redis 缓存加速
+"""
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Optional
+
 from rank_bm25 import BM25Okapi
 from FlagEmbedding import BGEM3FlagModel, FlagReranker
 from sqlalchemy.orm import Session
+
 from app.core.config import settings
+from app.core.redis_client import rag_cache, hyde_cache
 from app.domain.models import KnowledgeChunk
+
+logger = logging.getLogger(__name__)
 
 
 class RAGEngine:
     def __init__(self):
-        # 1. 加载 BGE-M3 向量模型 (用于向量化)
+        logger.info("加载 BGE-M3 向量模型...")
         self.embed_model = BGEM3FlagModel(settings.MODEL_BGE_M3_PATH, use_fp16=True)
-        # 2. 加载 BGE-Reranker 精排模型
-        self.reranker = FlagReranker(settings.MODEL_RERANKER_PATH, use_fp16=True)
-        # 3. BM25 索引内存缓存
-        self.bm25 = None
-        self.corpus = []
-        self.chunk_map = {}
 
+        logger.info("加载 BGE-Reranker 精排模型...")
+        self.reranker = FlagReranker(settings.MODEL_RERANKER_PATH, use_fp16=True)
+
+        # BM25 内存索引
+        self.bm25: Optional[BM25Okapi] = None
+        self.corpus: List[str] = []
+        self.chunk_ids: List[int] = []
+        self.chunk_map: Dict[int, Dict] = {}
+
+    # ==================== 第 1 层：HyDE 查询改写 ====================
+    def hyde_rewrite(self, small_llm, query: str) -> str:
+        """
+        HyDE（Hypothetical Document Embeddings）：
+          让小模型生成一个"假想答案"，用假想答案去检索，
+          缩小用户口语化 Query 与知识库文档之间的语义鸿沟。
+        """
+        # 先查缓存
+        cached = hyde_cache.get(query)
+        if cached:
+            return cached
+
+        prompt = (
+            "请用一句专业、简洁的话回答下面的问题，只输出答案本身，不要解释：\n"
+            f"{query}"
+        )
+        try:
+            hypothetical = small_llm.invoke(prompt).content.strip()
+        except Exception:
+            hypothetical = query
+
+        hyde_cache.set(query, hypothetical)
+        return hypothetical
+
+    # ==================== BM25 索引构建 ====================
     def build_bm25_index(self, db: Session):
-        """从数据库加载所有子块，构建 BM25 索引"""
+        """从 DB 加载所有子块，构建 BM25 内存索引"""
         chunks = db.query(KnowledgeChunk).all()
         self.corpus = [c.content for c in chunks]
-        self.chunk_map = {c.id: {"parent": c.parent_content, "content": c.content} for c in chunks}
-        # 中文按字切分（工程上可替换为 jieba 分词）
-        tokenized_corpus = [list(c.content) for c in chunks]
-        self.bm25 = BM25Okapi(tokenized_corpus)
+        self.chunk_ids = [c.id for c in chunks]
+        self.chunk_map = {
+            c.id: {"content": c.content, "parent": c.parent_content}
+            for c in chunks
+        }
+        tokenized = [list(c) for c in self.corpus]  # 中文按字切，可换 jieba
+        self.bm25 = BM25Okapi(tokenized) if tokenized else None
 
-    def vector_search(self, db: Session, query: str, top_k: int = 10) -> List[Dict]:
-        """向量检索：使用 pgvector 余弦距离"""
-        query_vector = self.embed_model.encode(query)['dense_vecs']
-        # 使用 pgvector 的 <=> 操作符（余弦距离）
-        results = db.query(KnowledgeChunk).order_by(
-            KnowledgeChunk.embedding.cosine_distance(query_vector)
-        ).limit(top_k).all()
-        return [{"id": r.id, "content": r.content, "parent": r.parent_content} for r in results]
+    # ==================== 第 2 层：并行多路召回 ====================
+    def _vector_search(self, db: Session, query: str, top_k: int = 10) -> List[Dict]:
+        """向量召回"""
+        vec = self.embed_model.encode(query)["dense_vecs"]
+        rows = (
+            db.query(KnowledgeChunk)
+            .order_by(KnowledgeChunk.embedding.cosine_distance(vec))
+            .limit(top_k)
+            .all()
+        )
+        return [
+            {"id": r.id, "content": r.content, "parent": r.parent_content}
+            for r in rows
+        ]
 
-    def bm25_search(self, query: str, top_k: int = 10) -> List[Dict]:
-        """BM25 关键词检索"""
-        if not self.bm25: return []
-        tokenized_query = list(query)
-        scores = self.bm25.get_scores(tokenized_query)
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-        return [{"id": idx, "content": self.corpus[idx], "score": scores[idx]} for idx in top_indices]
+    def _bm25_search(self, query: str, top_k: int = 10) -> List[Dict]:
+        """BM25 关键词召回"""
+        if not self.bm25:
+            return []
+        scores = self.bm25.get_scores(list(query))
+        top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+        return [
+            {"id": self.chunk_ids[i], "content": self.corpus[i],
+             "parent": self.chunk_map.get(self.chunk_ids[i], {}).get("parent", "")}
+            for i in top_idx
+        ]
 
-    def rrf_fusion(self, vector_results: List[Dict], bm25_results: List[Dict], k: int = 60) -> List[Dict]:
-        """RRF 融合算法（Reciprocal Rank Fusion）"""
-        rrf_scores = {}
-        # 向量结果权重
+    def parallel_recall(self, db: Session, query: str, top_k: int = 10) -> Dict[str, List[Dict]]:
+        """
+        并行执行 BM25 和向量召回，降低延迟
+        """
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_vec = pool.submit(self._vector_search, db, query, top_k)
+            f_bm25 = pool.submit(self._bm25_search, query, top_k)
+            return {
+                "vector": f_vec.result(),
+                "bm25": f_bm25.result(),
+            }
+
+    # ==================== 第 3 层：RRF 融合 ====================
+    @staticmethod
+    def rrf_fusion(
+        vector_results: List[Dict],
+        bm25_results: List[Dict],
+        k: int = 60,
+        top_n: int = 10,
+    ) -> List[Dict]:
+        """
+        RRF（Reciprocal Rank Fusion）：
+          score(d) = Σ 1 / (k + rank_i(d))
+        """
+        # 用 id 作为唯一标识（因为两路召回的 item 结构可能不同）
+        scores: Dict[int, float] = {}
+        content_map: Dict[int, Dict] = {}
+
         for rank, item in enumerate(vector_results):
-            rrf_scores[item["id"]] = rrf_scores.get(item["id"], 0) + 1 / (k + rank + 1)
-        # BM25 结果权重
+            scores[item["id"]] = scores.get(item["id"], 0) + 1 / (k + rank + 1)
+            content_map[item["id"]] = item
+
         for rank, item in enumerate(bm25_results):
-            rrf_scores[item["id"]] = rrf_scores.get(item["id"], 0) + 1 / (k + rank + 1)
+            scores[item["id"]] = scores.get(item["id"], 0) + 1 / (k + rank + 1)
+            content_map.setdefault(item["id"], item)
 
-        # 按 RRF 分数降序排列
-        sorted_items = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-        # 找出对应的内容，以便精排
-        fused = []
-        for idx, score in sorted_items[:10]:
-            if idx in self.chunk_map:
-                fused.append({"id": idx, "content": self.chunk_map[idx]["content"], "rrf_score": score})
-        return fused
+        sorted_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
+        return [
+            {**content_map[cid], "rrf_score": s}
+            for cid, s in sorted_ids
+            if cid in content_map
+        ]
 
-    def rerank(self, query: str, candidates: List[Dict]) -> List[Dict]:
+    # ==================== 第 3 层：Rerank 精排 ====================
+    def rerank(self, query: str, candidates: List[Dict], top_k: int = 3) -> List[Dict]:
         """Cross-Encoder 精排"""
-        if not candidates: return []
+        if not candidates:
+            return []
         pairs = [[query, c["content"]] for c in candidates]
         scores = self.reranker.compute_score(pairs)
+        if isinstance(scores, float):
+            scores = [scores]
         for i, c in enumerate(candidates):
-            c["rerank_score"] = scores[i]
-        return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+            c["rerank_score"] = float(scores[i])
+        return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)[:top_k]
 
-    def retrieve(self, db: Session, query: str) -> List[Dict]:
-        """对外暴露的统一检索接口：粗排 + 精排 + 父子召回"""
-        # 1. 多路召回
-        vec_res = self.vector_search(db, query)
-        bm25_res = self.bm25_search(query)
+    # ==================== 主入口：完整检索流程 ====================
+    def retrieve(
+        self,
+        db: Session,
+        query: str,
+        small_llm=None,
+        use_hyde: bool = True,
+        top_k: int = 3,
+    ) -> List[Dict]:
+        """
+        完整检索流程：
+          1. HyDE 改写（可选）
+          2. Redis 缓存查询
+          3. 并行召回（BM25 + 向量）
+          4. RRF 融合
+          5. Rerank 精排
+          6. Small-to-Big 返回父块
+        """
+        # ---------- 缓存命中 ----------
+        cache_key = f"{query}|hyde={use_hyde}"
+        cached = rag_cache.get(cache_key)
+        if cached:
+            logger.info(f"🎯 RAG 缓存命中：{query[:30]}")
+            return cached
 
-        # 2. RRF 融合
-        fused = self.rrf_fusion(vec_res, bm25_res)
+        # ---------- 1. HyDE 改写 ----------
+        search_query = query
+        if use_hyde and small_llm:
+            search_query = self.hyde_rewrite(small_llm, query)
 
-        # 3. Cross-Encoder 精排
-        reranked = self.rerank(query, fused[:5])  # 取融合后的前5个做精排
+        # ---------- 2. 并行召回 ----------
+        recall = self.parallel_recall(db, search_query, top_k=10)
 
-        # 4. 父子文档召回：返回父块内容（给 LLM 用）
-        final_results = []
-        for r in reranked[:3]:
-            c_id = r["id"]
-            parent_content = self.chunk_map.get(c_id, {}).get("parent", r["content"])
-            final_results.append({
-                "content": r["content"],
-                "parent_content": parent_content,
-                "score": r.get("rerank_score", 0)
+        # ---------- 3. RRF 融合 ----------
+        fused = self.rrf_fusion(recall["vector"], recall["bm25"], top_n=10)
+
+        # ---------- 4. Rerank 精排 ----------
+        reranked = self.rerank(query, fused[:5], top_k=top_k)
+
+        # ---------- 5. Small-to-Big：返回父块 ----------
+        final = []
+        for item in reranked:
+            cid = item["id"]
+            parent = self.chunk_map.get(cid, {}).get("parent", item["content"])
+            final.append({
+                "id": cid,
+                "content": item["content"],
+                "parent_content": parent,
+                "rrf_score": item.get("rrf_score", 0.0),
+                "rerank_score": item.get("rerank_score", 0.0),
             })
-        return final_results
+
+        # ---------- 6. 写缓存 ----------
+        rag_cache.set(cache_key, final)
+        return final
